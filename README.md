@@ -1,9 +1,49 @@
+# DKC1Recomp NX — 60 fps edition
+
+Fork of [souldbminerr/DKC1Recomp-NX](https://github.com/souldbminerr/DKC1Recomp-NX)
+(itself based on [elliotttate/DKC1Recomp](https://github.com/elliotttate/DKC1Recomp))
+with these Nintendo Switch improvements:
+
+- **Locked 60 fps pacing**: the swap chain's real vblank paces the game
+  (renderer vsync) instead of a free-running software clock that drifted
+  against the display and dropped/duplicated frames.
+- **CPU boost to 1785 MHz** while playing (clkrst/pcv), restored on exit and
+  re-applied after dock/undock or sleep.
+- **On-screen error** when the ROM is missing or unsupported (system error
+  dialog) instead of a silent exit.
+- **New icon** and a minimal RomFS so the .nro also boots on emulators that
+  require one.
+- **Self-contained build**: the Switch layer for the `snesrecomp` framework is
+  shipped in `switch/snesrecomp-overlay/` and applied with one script.
+
+No game code or ROM is included. You need your own *Donkey Kong Country*
+(USA) v1.0 ROM.
+
+## Building (devkitPro, Linux/WSL)
+
+```bash
+git clone --recursive https://github.com/<you>/DKC1Recomp-NX
+cd DKC1Recomp-NX
+sh scripts/setup_switch_framework.sh          # Switch layer -> snesrecomp
+python3 scripts/generate_snesrecomp.py --rom /path/to/dkc1.sfc   # needs Rust (cargo)
+make -f Makefile.switch
+```
+
+## Installing
+
+```
+sdmc:/switch/dkc1/dkc1.nro
+sdmc:/switch/dkc1/rom.smc     (rom.sfc also accepted)
+```
+
+---
+
 # AI Usage Disclosure from Soul
 Yes, I used AI.
 No, I don't care about your opinion
 This was to simply port a game I love to Switch without spending a week.
 
-# DKC1Recomp
+# DKC1Recomp (upstream README)
 
 Static recompilation of *Donkey Kong Country* (SNES, USA v1.0) into a native
 desktop application, using the project's pinned
@@ -289,3 +329,10 @@ effort, which is kept only as reference material.
 - Never commit ROMs, saves, extracted assets, or generated game binaries.
 - `recomp/*.cfg` contain only names, PCs, and structural metadata derived
   from the GPL-3 disassembly; provenance is recorded in each file header.
+
+## Donations
+
+This emulator is completely free and open-source. Optional donations to support the development are always welcome:
+
+[![Ko-fi](https://img.shields.io/badge/Ko--fi-Support-FF5E5B?style=for-the-badge&logo=ko-fi&logoColor=white)](https://ko-fi.com/toniisound)
+[![PayPal](https://img.shields.io/badge/PayPal-Donate-00457C?style=for-the-badge&logo=paypal&logoColor=white)](https://paypal.me/toniisound)

@@ -42,6 +42,15 @@ int Dkc1SwitchPadCount(void);
  * false when the applet itself fails. */
 bool Dkc1SwitchOpenControllerApplet(void);
 
+/* Performance profile (runner/switch_platform.c): CPU at 1785 MHz while
+ * the game runs, restored on exit. Tick re-asserts it after dock/sleep. */
+void Dkc1SwitchPerfBegin(void);
+void Dkc1SwitchPerfTick(void);
+void Dkc1SwitchPerfEnd(void);
+
+/* Native system error dialog (blocks until dismissed). */
+void Dkc1SwitchShowError(const char *title, const char *message);
+
 /* Left-stick deflection that counts as a DPad press (raw SDL units). */
 #define DKC1_SWITCH_STICK_DPAD_DEADZONE 8000
 

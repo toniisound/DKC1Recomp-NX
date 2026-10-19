@@ -13,6 +13,7 @@
 #ifdef __SWITCH__
 
 #include <SDL.h>
+#include <switch.h>
 
 #include <stdlib.h>
 #include <string.h>
@@ -181,6 +182,77 @@ void Dkc1MacMetalPresenterFlush(void) {}
 void Dkc1MacMetalPresenterStop(void) {}
 void Dkc1MacMetalPresenterSetGraphics(const Dkc1GraphicsSettings *settings) {
   (void)settings;
+}
+
+/* ---- On-screen errors ---------------------------------------------------
+ * Switch SDL2 has no message-box backend and hbmenu shows no stderr, so a
+ * missing ROM used to look like a silent crash. The system error applet
+ * draws a native dialog and blocks until the player dismisses it. */
+#include <stdio.h>
+
+void Dkc1SwitchShowError(const char *title, const char *message) {
+  char dialog[512];
+  ErrorApplicationConfig config;
+  snprintf(dialog, sizeof dialog, "%s\n\n%s",
+           title ? title : "DKC1 NX", message ? message : "");
+  if (R_SUCCEEDED(errorApplicationCreate(&config, dialog, NULL)))
+    (void)errorApplicationShow(&config);
+}
+
+/* ---- Performance profile (DKC1 NX) ------------------------------------
+ * The stock 1020 MHz CPU clock is not enough to hold the recompiled game
+ * plus SPC700/DSP audio at a locked 60 fps in busy stages. Raise the CPU
+ * bus to 1785 MHz (the clock the console itself uses for boost/loading
+ * screens; safe in handheld and docked) and put it back on exit.
+ * Horizon may reset clocks on dock/undock or after sleep, so the main
+ * loop re-asserts it periodically via Dkc1SwitchPerfTick(). Emulators that
+ * stub clkrst/pcv (Ryujinx) simply ignore it. */
+#define DKC1_SWITCH_CPU_HZ 1785000000u
+
+static int s_perf_mode;        /* 0 = off, 1 = clkrst, 2 = pcv */
+static ClkrstSession s_clk_cpu;
+static u32 s_cpu_hz_saved;
+
+static void PerfApply(void) {
+  if (s_perf_mode == 1)
+    (void)clkrstSetClockRate(&s_clk_cpu, DKC1_SWITCH_CPU_HZ);
+  else if (s_perf_mode == 2)
+    (void)pcvSetClockRate(PcvModule_CpuBus, DKC1_SWITCH_CPU_HZ);
+}
+
+void Dkc1SwitchPerfBegin(void) {
+  if (s_perf_mode) return;
+  if (hosversionAtLeast(8, 0, 0)) {
+    if (R_SUCCEEDED(clkrstInitialize())) {
+      if (R_SUCCEEDED(clkrstOpenSession(&s_clk_cpu, PcvModuleId_CpuBus, 3))) {
+        if (R_FAILED(clkrstGetClockRate(&s_clk_cpu, &s_cpu_hz_saved)))
+          s_cpu_hz_saved = 0;
+        s_perf_mode = 1;
+      } else {
+        clkrstExit();
+      }
+    }
+  } else if (R_SUCCEEDED(pcvInitialize())) {
+    if (R_FAILED(pcvGetClockRate(PcvModule_CpuBus, &s_cpu_hz_saved)))
+      s_cpu_hz_saved = 0;
+    s_perf_mode = 2;
+  }
+  PerfApply();
+}
+
+void Dkc1SwitchPerfTick(void) { PerfApply(); }
+
+void Dkc1SwitchPerfEnd(void) {
+  if (s_perf_mode == 1) {
+    if (s_cpu_hz_saved) (void)clkrstSetClockRate(&s_clk_cpu, s_cpu_hz_saved);
+    clkrstCloseSession(&s_clk_cpu);
+    clkrstExit();
+  } else if (s_perf_mode == 2) {
+    if (s_cpu_hz_saved)
+      (void)pcvSetClockRate(PcvModule_CpuBus, s_cpu_hz_saved);
+    pcvExit();
+  }
+  s_perf_mode = 0;
 }
 
 #endif /* __SWITCH__ */

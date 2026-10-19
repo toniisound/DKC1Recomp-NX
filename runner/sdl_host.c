@@ -290,6 +290,17 @@ static int RunStartupScript(char *error, size_t error_size) {
   return 1;
 }
 
+/* Switch with a vsync'd swap chain: SDL_RenderPresent blocks on the
+ * vblank, so the software waits below are skipped (they would only eat
+ * into the frame budget and fight the real display clock). */
+static int VsyncPaced(void) {
+#ifdef __SWITCH__
+  return s_renderer_vsync;
+#else
+  return 0;
+#endif
+}
+
 static double FramePacerNow(void) {
 #ifdef __SWITCH__
   /* SDL performance counter as nanoseconds (no Mach clock on Horizon). */
@@ -794,9 +805,11 @@ static void FramePacerPrintStats(const Dkc1FramePacer *pacer) {
 
 static void ShowError(const char *title, const char *message) {
   fprintf(stderr, "%s: %s\n", title, message);
-#ifndef __SWITCH__
-  /* Switch SDL2 has no message-box backend; stderr (nxlink / debug.log
-   * file logging) carries the report instead. */
+#ifdef __SWITCH__
+  /* Switch SDL2 has no message-box backend: use the system error applet
+   * so the player actually sees the problem instead of a silent exit. */
+  Dkc1SwitchShowError(title, message);
+#else
   if (SDL_WasInit(SDL_INIT_VIDEO))
     SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, title, message, s_window);
 #endif
@@ -1056,9 +1069,16 @@ static bool InitVideo(void) {
   /* The fixed Mach clock is the default and sole presentation authority.
    * SDL's blocking Metal vsync is retained only as an explicit diagnostic;
    * the macOS compositor still prevents direct-scanout tearing. */
+#ifdef __SWITCH__
+  /* Switch: the panel/TV scan out at exactly 60 Hz, so the swap chain is
+   * the pacing authority. A free-running software clock drifts against
+   * the real vblank and drops/duplicates frames (visible judder). */
+  const int request_vsync = 1;
+#else
   const int request_vsync =
       EnvironmentEnabled("DKC1_KEEP_RENDERER_VSYNC") &&
       !EnvironmentEnabled("DKC1_DISABLE_VSYNC");
+#endif
   const Uint32 renderer_flags =
       SDL_RENDERER_ACCELERATED |
       (request_vsync ? SDL_RENDERER_PRESENTVSYNC : 0);
@@ -2148,6 +2168,9 @@ static void PollEvents(void) {
 }
 
 static void Cleanup(uint8_t *rom) {
+#ifdef __SWITCH__
+  Dkc1SwitchPerfEnd();
+#endif
 #ifdef _WIN32
   Dkc1WindowsDetach();
   Dkc1WindowsGraphicsClose();
@@ -2190,6 +2213,7 @@ int main(int argc, char **argv) {
 #ifdef __SWITCH__
   /* Seamless handheld boot: SD app dir becomes cwd before anything else. */
   SwitchImpl_Init();
+  Dkc1SwitchPerfBegin();
 #endif
 #ifndef _WIN32
 #ifndef __SWITCH__
@@ -2234,8 +2258,13 @@ int main(int argc, char **argv) {
   {
     const char *positional = argc > 1 ? argv[1] : NULL;
     if (!SwitchImpl_ResolveRom(rom_path, sizeof rom_path, positional)) {
-      ShowError("DKC1Recomp",
-                "No ROM found. Copy rom.smc to sdmc:/switch/dkc1/.");
+      ShowError("Donkey Kong Country - ROM not found / ROM no encontrada",
+                "Copy your Donkey Kong Country (USA) v1.0 ROM to:\n"
+                "  sdmc:/switch/" SWITCH_APP_DIR "/rom.smc\n"
+                "(rom.sfc is also accepted)\n\n"
+                "Copia tu ROM de Donkey Kong Country (USA) v1.0 en:\n"
+                "  sdmc:/switch/" SWITCH_APP_DIR "/rom.smc\n"
+                "(tambien vale rom.sfc)");
       ThrowMissingROM();
       SDL_Quit();
       return 2;
@@ -2508,7 +2537,7 @@ int main(int argc, char **argv) {
         }
         pacing_log.target = pacer.next_deadline;
         display_frame_sync = 1;
-      } else {
+      } else if (!VsyncPaced()) {
         FramePacerWaitForWorkWindow(&pacer);
         pacing_log.target = pacer.next_deadline;
       }
@@ -2662,6 +2691,8 @@ int main(int argc, char **argv) {
       RtlWriteSram();
     /* Dock/handheld transitions mid-session: resize to the matching
      * mode (checked 12x/sec; SDL_SetWindowSize switches the output). */
+    if ((s_host_frame % 300) == 0)
+      Dkc1SwitchPerfTick();
     if ((s_host_frame % 5) == 0) {
       int want_w = 1280, want_h = 720;
       int cur_w = 0, cur_h = 0;
@@ -2739,12 +2770,14 @@ int main(int argc, char **argv) {
         }
         pacing_log.target = pacer.next_deadline;
       }
-      const double final_wait_start = FramePacerNow();
-      FramePacerWaitUntil(
-          pacer.next_deadline - pacer.frequency * kMacSubmitLeadSeconds,
-          pacer.frequency);
-      pacing_log.wait_ms +=
-          (FramePacerNow() - final_wait_start) * 1000.0 / pacer.frequency;
+      if (!VsyncPaced()) {
+        const double final_wait_start = FramePacerNow();
+        FramePacerWaitUntil(
+            pacer.next_deadline - pacer.frequency * kMacSubmitLeadSeconds,
+            pacer.frequency);
+        pacing_log.wait_ms +=
+            (FramePacerNow() - final_wait_start) * 1000.0 / pacer.frequency;
+      }
     }
     const double present_start = FramePacerNow();
     SubmitPresentation();

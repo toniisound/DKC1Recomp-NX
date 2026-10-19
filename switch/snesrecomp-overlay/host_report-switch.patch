@@ -1,0 +1,45 @@
+commit 896586aef92b60f6e3e8c6c68c014d31886b5975
+Author: souldbminersmwc <souldbyt@gmail.com>
+Date:   Tue Sep 8 19:42:33 2026 -0400
+
+    switch port
+
+diff --git a/runner/src/host_report.c b/runner/src/host_report.c
+index fdac6b2..2e632ad 100644
+--- a/runner/src/host_report.c
++++ b/runner/src/host_report.c
+@@ -50,7 +50,11 @@
+ #endif
+ #else
+ #include <pthread.h>
++#ifndef __SWITCH__
++/* newlib on Horizon has no uname(2); the __SWITCH__ OS branch below
++ * reports the platform statically. */
+ #include <sys/utsname.h>
++#endif
+ #include <unistd.h>
+ #if defined(__linux__)
+ #include <link.h>
+@@ -283,6 +287,14 @@ static void dump_os_json(FILE *f) {
+         (unsigned long)si.dwNumberOfProcessors, esc_brand,
+         (unsigned long long)(ms.ullTotalPhys >> 20),
+         (unsigned long long)(ms.ullAvailPhys >> 20));
++#else
++#ifdef __SWITCH__
++    char brand[64], esc_brand[128];
++    dump_cpu_brand(brand, sizeof(brand));
++    hr_json_escape(brand, esc_brand, sizeof(esc_brand));
++    fprintf(f, "  \"os\": {\"platform\": \"horizon\", \"arch\": \"aarch64\","
++            " \"cpu_brand\": \"%s\"},\n",
++            esc_brand);
+ #else
+     struct utsname un;
+     char brand[64], esc_brand[128];
+@@ -302,6 +314,7 @@ static void dump_os_json(FILE *f) {
+                 esc_brand);
+     }
+ #endif
++#endif
+ }
+ 
+ static void dump_sdl_json(FILE *f) {

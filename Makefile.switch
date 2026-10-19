@@ -3,6 +3,8 @@
 # No CMake, no launcher/menus: the NRO boots straight from
 # sdmc:/switch/dkc1/rom.smc. Requires devkitA64 + switch portlibs SDL2.
 #
+#   0. Add the Switch layer to the snesrecomp submodule (once):
+#        sh scripts/setup_switch_framework.sh
 #   1. Generate private sources once (needs the USA v1.0 ROM):
 #        python scripts/generate_snesrecomp.py --rom <path>/dkc1.sfc
 #   2. make -f Makefile.switch            # -> dkc1.nro + dkc1.nacp
@@ -109,7 +111,7 @@ GAME_DEFS += -DSWITCH_DEBUG
 endif
 
 DATA		:=
-ROMFS		:=
+ROMFS		:=	romfs
 APP_ICON	:=	$(TOPDIR)/assets/switch/icon.jpg
 
 ARCH	:=	-march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE
@@ -196,12 +198,12 @@ all	:	$(OUTPUT).nro
 $(OUTPUT).nro	:	$(OUTPUT).elf $(OUTPUT).nacp
 
 # Explicit link through a response file: generated recomp trees put
-# hundreds of objects on the link line, past Windows' CreateProcess
-# limit ("Argument list too long").
+# hundreds of objects on the link line, past the shell's argument limit
+# ("Argument list too long"). $(file) writes it from make itself, so no
+# giant shell command is ever built.
 $(OUTPUT).elf	:	$(OFILES)
 	@echo linking $(notdir $@)
-	@rm -f $(DEPSDIR)/objects.rsp
-	@$(foreach o,$(OFILES),echo $(o) >> $(DEPSDIR)/objects.rsp;)
+	$(file >$(DEPSDIR)/objects.rsp,$(OFILES))
 	@$(LD) $(LDFLAGS) @$(DEPSDIR)/objects.rsp $(LIBPATHS) $(LIBS) -o $@
 	@$(NM) -CSn $@ > $(OUTPUT).lst
 
