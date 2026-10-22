@@ -17,6 +17,7 @@
 #include "input_playback.h"
 #include "desktop_audio_rate.h"
 #include "desktop_rewind.h"
+#include "desktop_sram.h"
 #include "desktop_input.h"
 #include "macos_controls.h"
 #include "macos_pause_menu.h"
@@ -55,6 +56,8 @@
  * below comes from runner/switch_platform.c on Switch. */
 #include "switch_gamepad.h"
 #include "switch_impl.h"
+#include "switch_graphics.h"
+#include "switch_ui.h"
 #include <switch.h>
 #endif
 #include <stdbool.h>
@@ -222,6 +225,27 @@ static int s_width;
 static int s_presentation_output_width;
 static int s_presentation_output_height;
 static int s_renderer_vsync;
+#ifdef __SWITCH__
+/* In-game saves: written as soon as the cartridge RAM changes. */
+static Dkc1SramStore s_sram_store;
+static int s_sram_error_reported;
+/* Switch UI state: in-game toast, pause menu, life-change rumble. */
+static char s_toast[64];
+static int s_toast_frames;
+static int s_menu_open;
+static int s_last_lives = -1;
+/* 1 when the OpenGL presenter (HD Reconstruct) owns the window; 0 when the
+ * plain SDL renderer fallback is in use. */
+static int s_switch_gl;
+#endif
+
+static int SwitchGlActive(void) {
+#ifdef __SWITCH__
+  return s_switch_gl;
+#else
+  return 0;
+#endif
+}
 static int s_display_link_active;
 static int s_metal_presenter_active;
 static long s_host_frame;
@@ -975,6 +999,8 @@ static void ApplyPresentationGeometry(void) {
   return; /* OpenGL fits the live drawable each frame, preserving SNES PAR. */
 #endif
 #ifdef __SWITCH__
+  if (s_switch_gl)
+    return; /* OpenGL fits the live drawable each frame. */
   /* Edge-to-edge handheld picture: no logical size, no integer scale,
    * full viewport, linear sampling for the fractional stretch. Without
    * this the integer scaler fits 399x224 into 1197x672 and centers it,
@@ -984,7 +1010,9 @@ static void ApplyPresentationGeometry(void) {
   SDL_RenderSetScale(s_renderer, 1.0f, 1.0f);
   SDL_RenderSetViewport(s_renderer, NULL);
   if (s_texture)
-    (void)SDL_SetTextureScaleMode(s_texture, SDL_ScaleModeLinear);
+    (void)SDL_SetTextureScaleMode(
+        s_texture, s_graphics.upscaler == kDkc1UpscalerNearest
+                       ? SDL_ScaleModeNearest : SDL_ScaleModeLinear);
   s_presentation_output_width = 0;
   s_presentation_output_height = 0;
   return;
@@ -1045,7 +1073,21 @@ static bool InitVideo(void) {
     }
     (void)window_width;
     (void)window_height;
-    s_window = SDL_CreateWindow("DKC1Recomp", 0, 0, switch_w, switch_h, 0);
+    /* Prefer the OpenGL presenter (needed for the HD Reconstruct
+     * upscaler); fall back to the SDL renderer if GL cannot start. */
+    Dkc1SwitchGraphicsPrepareAttributes();
+    s_window = SDL_CreateWindow("DKC1Recomp", 0, 0, switch_w, switch_h,
+                                SDL_WINDOW_OPENGL);
+    if (s_window && Dkc1SwitchGraphicsInit(s_window)) {
+      s_switch_gl = 1;
+      s_renderer_vsync = Dkc1SwitchGraphicsVsync();
+      return true;
+    }
+    fprintf(stderr, "[switch-graphics] OpenGL presenter unavailable; "
+                    "using the SDL renderer (no HD upscaler)\n");
+    Dkc1SwitchGraphicsResetAttributes();
+    if (!s_window)
+      s_window = SDL_CreateWindow("DKC1Recomp", 0, 0, switch_w, switch_h, 0);
   }
 #else
   s_window = SDL_CreateWindow(
@@ -1183,10 +1225,34 @@ static void InitDisplayLink(void) {
 #endif
 }
 
+#ifdef __SWITCH__
+static void SwitchToast(const char *text) {
+  snprintf(s_toast, sizeof s_toast, "%s", text ? text : "");
+  s_toast_frames = 120; /* two seconds */
+}
+
+static void SwitchDrawToast(void) {
+  if (s_menu_open || s_toast_frames <= 0) return;
+  Dkc1SwitchUiClear();
+  Dkc1SwitchUiFill(6, 6, Dkc1SwitchUiTextWidth(s_toast) + 14, 20,
+                   0xC0101018u);
+  Dkc1SwitchUiText(13, 12, s_toast, 0xFFFFE070u);
+  Dkc1SwitchUiPresent(s_renderer);
+}
+#endif
+
 static void PreparePresentation(void) {
   const uint8_t *display=Dkc1DesktopColorFilterApply(&s_color_filter,s_pixels,
       s_display_pixels,(size_t)s_width*kDkc1VideoHeight);
   if (!display) display=s_pixels;
+#ifdef __SWITCH__
+  if (s_switch_gl) {
+    Dkc1SwitchGraphicsDraw((const uint32_t *)display, s_width,
+                           kDkc1VideoHeight, PresentationWidth(), &s_graphics);
+    SwitchDrawToast();
+    return;
+  }
+#endif
 #ifdef _WIN32
   Dkc1WindowsGraphicsDraw((const uint32_t *)display,s_width,kDkc1VideoHeight,
                          PresentationWidth(),&s_graphics);
@@ -1234,12 +1300,43 @@ static void PreparePresentation(void) {
       destination_ptr = &destination;
     }
   }
+#ifdef __SWITCH__
+  {
+    /* 4:3 and 16:10 keep their shape (pillarboxed); a frame wider than
+     * the panel (the 16:9 widescreen mode) fills it edge to edge. */
+    int output_width = 0;
+    int output_height = 0;
+    if (SDL_GetRendererOutputSize(s_renderer, &output_width,
+                                  &output_height) == 0 &&
+        output_width > 0 && output_height > 0) {
+      const int presentation_width = PresentationWidth();
+      if ((int64_t)presentation_width * output_height <
+          (int64_t)output_width * kDkc1VideoHeight) {
+        destination.h = output_height;
+        destination.w = (output_height * presentation_width +
+                         kDkc1VideoHeight / 2) / kDkc1VideoHeight;
+        destination.x = (output_width - destination.w) / 2;
+        destination.y = 0;
+        destination_ptr = &destination;
+      }
+    }
+  }
+#endif
   SDL_UpdateTexture(s_texture, NULL, display, s_width * 4);
   SDL_RenderClear(s_renderer);
   SDL_RenderCopy(s_renderer, s_texture, NULL, destination_ptr);
+#ifdef __SWITCH__
+  SwitchDrawToast();
+#endif
 }
 
 static void SubmitPresentation(void) {
+#ifdef __SWITCH__
+  if (s_switch_gl) {
+    Dkc1SwitchGraphicsSwap();
+    return;
+  }
+#endif
 #ifdef _WIN32
   Dkc1WindowsGraphicsSwap();
   return;
@@ -1365,6 +1462,10 @@ static void HapticWorkerStop(void) {
 }
 
 static void StopControllerRumble(void) {
+#ifdef __SWITCH__
+  Dkc1SwitchRumbleStop();
+  return;
+#endif
   if (s_haptic_worker.thread)
     HapticWorkerRequest(kHapticRequestStop);
   else if (s_controller)
@@ -1372,6 +1473,12 @@ static void StopControllerRumble(void) {
 }
 
 static void PulseStompHaptic(void) {
+#ifdef __SWITCH__
+  /* HD Rumble: short, bright tap for a stomp. */
+  if (s_haptics_enabled)
+    Dkc1SwitchRumble(0.30f, 0.70f, 4);
+  return;
+#endif
   if (!s_haptics_enabled || !s_controller)
     return;
   /* A short, brighter high-frequency pulse reads as a stomp without masking
@@ -1459,8 +1566,13 @@ static uint32_t PollInput(void) {
 #endif
   unsigned menu_buttons=0;
   for (size_t i=0;i<count;i++) menu_buttons|=pads[i].buttons;
+#ifdef __SWITCH__
+  /* Switch: Minus opens the pause menu; Plus stays the game's Start. */
+  if (menu_buttons&kDkc1GamepadBack) {
+#else
   if ((menu_buttons&kDkc1GamepadGuide) ||
       (menu_buttons&(kDkc1GamepadStart|kDkc1GamepadBack))==(kDkc1GamepadStart|kDkc1GamepadBack)) {
+#endif
     if (!s_input_release_gate) OpenPauseMenu(0);
     return 0;
   }
@@ -1665,6 +1777,9 @@ static void CaptureRewind(void) {
 }
 
 static void ReconcileHostTimeline(void) {
+#ifdef __SWITCH__
+  s_last_lives = -1; /* new timeline: no life-change rumble on load */
+#endif
   ResetAudioTimeline();
   Dkc1MacMetalPresenterFlush();
   Dkc1Msu1Reset(s_msu1);
@@ -1704,10 +1819,20 @@ static const char *StateSlotPath(void) {
   return paths[s_graphics.state_slot];
 }
 static void QuickSave(void) {
-  if (RtlSaveSnapshot(StateSlotPath()))
+  const int saved = RtlSaveSnapshot(StateSlotPath());
+  if (saved)
     snprintf(s_status, sizeof s_status, "saved %s",StateSlotPath());
   else
     snprintf(s_status, sizeof s_status, "quick save FAILED");
+#ifdef __SWITCH__
+  {
+    char toast[48];
+    snprintf(toast, sizeof toast, saved ? "State saved (slot %d)"
+                                        : "Save FAILED (slot %d)",
+             s_graphics.state_slot + 1);
+    SwitchToast(toast);
+  }
+#endif
   s_reanchor_pacer = 1;
   UpdateTitle();
 }
@@ -1715,7 +1840,23 @@ static void QuickSave(void) {
 static void QuickLoad(void) {
   if (!RtlLoadSnapshot(StateSlotPath())) {
     snprintf(s_status, sizeof s_status, "quick load FAILED");
+#ifdef __SWITCH__
+    {
+      char toast[48];
+      snprintf(toast, sizeof toast, "No state in slot %d",
+               s_graphics.state_slot + 1);
+      SwitchToast(toast);
+    }
+#endif
   } else {
+#ifdef __SWITCH__
+    {
+      char toast[48];
+      snprintf(toast, sizeof toast, "State loaded (slot %d)",
+               s_graphics.state_slot + 1);
+      SwitchToast(toast);
+    }
+#endif
     ClearRewind();
     ReconcileHostTimeline();
     char error[256];
@@ -1758,17 +1899,20 @@ static void SetAspectMode(Dkc1VideoAspect requested) {
   Dkc1VideoSetAspect(requested);
   const int new_width = Dkc1VideoWidth();
 #ifndef _WIN32
-  SDL_Texture *new_texture = SDL_CreateTexture(
-      s_renderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING,
-      new_width, kDkc1VideoHeight);
-  if (!new_texture) {
-    Dkc1VideoSetAspect(old_aspect);
-    snprintf(s_status, sizeof s_status, "aspect change failed: %.180s",
-             SDL_GetError());
-    UpdateTitle();
-    return;
+  SDL_Texture *new_texture = NULL;
+  if (!SwitchGlActive()) { /* the GL presenter resizes its own texture */
+    new_texture = SDL_CreateTexture(
+        s_renderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING,
+        new_width, kDkc1VideoHeight);
+    if (!new_texture) {
+      Dkc1VideoSetAspect(old_aspect);
+      snprintf(s_status, sizeof s_status, "aspect change failed: %.180s",
+               SDL_GetError());
+      UpdateTitle();
+      return;
+    }
+    SDL_SetTextureBlendMode(new_texture, SDL_BLENDMODE_NONE);
   }
-  SDL_SetTextureBlendMode(new_texture, SDL_BLENDMODE_NONE);
 #endif
 
   static uint8_t remapped[kDkc1VideoWidescreenWidth *
@@ -1786,8 +1930,10 @@ static void SetAspectMode(Dkc1VideoAspect requested) {
          (size_t)new_width * kDkc1VideoHeight * 4);
 
 #ifndef _WIN32
-  SDL_DestroyTexture(s_texture);
-  s_texture = new_texture;
+  if (new_texture) {
+    SDL_DestroyTexture(s_texture);
+    s_texture = new_texture;
+  }
 #endif
   s_width = new_width;
   s_graphics.aspect=requested; Dkc1MacSaveGraphics(&s_graphics);
@@ -1898,6 +2044,275 @@ unsigned Dkc1MacPauseMenuController(void) {
   return result;
 }
 
+#ifdef __SWITCH__
+/* ---- Switch pause menu -------------------------------------------------
+ * Opened with the Minus button (Plus remains the game's own pause). Modal:
+ * the
+ * guest is frozen, audio is paused, and the loop below redraws the last
+ * game frame plus the overlay at the display rate (vsync'd present). */
+enum {
+  kSwitchMenuResume,
+  kSwitchMenuSave,
+  kSwitchMenuLoad,
+  kSwitchMenuSlot,
+  kSwitchMenuAspect,
+  kSwitchMenuScaling,
+  kSwitchMenuHdDetail,
+  kSwitchMenuVolume,
+  kSwitchMenuRumble,
+  kSwitchMenuExit,
+  kSwitchMenuCount,
+};
+
+static const char *SwitchAspectLabel(int aspect) {
+  return aspect == kDkc1VideoAspectNative ? "4:3"
+       : aspect == kDkc1VideoAspect16x10  ? "16:10"
+                                           : "16:9";
+}
+
+static void SwitchMenuValue(int item, char *out, size_t size) {
+  out[0] = 0;
+  switch (item) {
+    case kSwitchMenuSlot:
+      snprintf(out, size, "< %d >", s_graphics.state_slot + 1);
+      break;
+    case kSwitchMenuAspect:
+      snprintf(out, size, "< %s >", SwitchAspectLabel(Dkc1VideoGetAspect()));
+      break;
+    case kSwitchMenuScaling:
+      snprintf(out, size, "< %s >",
+               s_graphics.upscaler == kDkc1UpscalerNearest       ? "Sharp"
+               : s_graphics.upscaler == kDkc1UpscalerReconstruct ? "HD"
+                                                                 : "Smooth");
+      break;
+    case kSwitchMenuHdDetail: {
+      static const char *const kModes[] = {"Pixels", "Dither", "Diagonals",
+                                           "Slopes", "Slopes+"};
+      if (s_graphics.upscaler != kDkc1UpscalerReconstruct)
+        snprintf(out, size, "(HD only)");
+      else
+        snprintf(out, size, "< %s >",
+                 kModes[s_graphics.reconstruct_mode < 0 ||
+                                s_graphics.reconstruct_mode > 4
+                            ? 3
+                            : s_graphics.reconstruct_mode]);
+      break;
+    }
+    case kSwitchMenuVolume:
+      snprintf(out, size, "< %d%% >",
+               s_graphics.audio_enabled ? s_graphics.volume : 0);
+      break;
+    case kSwitchMenuRumble:
+      snprintf(out, size, "< %s >", Dkc1SwitchRumbleEnabled() ? "On" : "Off");
+      break;
+    default:
+      break;
+  }
+}
+
+static void SwitchDrawMenu(int selected, const char *status) {
+  static const char *const kLabels[kSwitchMenuCount] = {
+    "Resume", "Save state", "Load state", "State slot", "Aspect ratio",
+    "Scaling", "HD detail", "Volume", "Rumble", "Exit game",
+  };
+  const int panel_w = 260;
+  const int line_h = 13;
+  const int panel_h = 40 + kSwitchMenuCount * line_h + 50;
+  const int panel_x = (kDkc1SwitchUiWidth - panel_w) / 2;
+  const int panel_y = (kDkc1SwitchUiHeight - panel_h) / 2;
+  Dkc1SwitchUiClear();
+  Dkc1SwitchUiFill(0, 0, kDkc1SwitchUiWidth, kDkc1SwitchUiHeight,
+                   0x80000000u);
+  Dkc1SwitchUiFill(panel_x, panel_y, panel_w, panel_h, 0xE0141420u);
+  Dkc1SwitchUiFill(panel_x, panel_y, panel_w, 2, 0xFFFFC020u);
+  Dkc1SwitchUiTextCentered(panel_y + 10, "DKC1RECOMP-NX  v0.0.17",
+                           0xFFFFC020u);
+  Dkc1SwitchUiTextCentered(panel_y + 22, "Paused", 0xFF9090A0u);
+  for (int i = 0; i < kSwitchMenuCount; i++) {
+    const int y = panel_y + 40 + i * line_h;
+    const int is_selected = i == selected;
+    char value[32];
+    if (is_selected)
+      Dkc1SwitchUiFill(panel_x + 8, y - 3, panel_w - 16, line_h,
+                       0xFF2E3A66u);
+    Dkc1SwitchUiText(panel_x + 18, y, kLabels[i],
+                     is_selected ? 0xFFFFFFFFu : 0xFFC8C8D0u);
+    SwitchMenuValue(i, value, sizeof value);
+    if (value[0])
+      Dkc1SwitchUiText(panel_x + panel_w - 18 - Dkc1SwitchUiTextWidth(value),
+                       y, value, is_selected ? 0xFFFFE070u : 0xFFB0B0B8u);
+  }
+  const int footer_y = panel_y + 42 + kSwitchMenuCount * line_h;
+  if (status && *status)
+    Dkc1SwitchUiTextCentered(footer_y, status, 0xFF80FF80u);
+  Dkc1SwitchUiTextCentered(footer_y + 14, "A select  B/- back  </> change",
+                           0xFF9090A0u);
+  Dkc1SwitchUiTextCentered(footer_y + 26, "In game: L3 save  R3 load",
+                           0xFF9090A0u);
+}
+
+static uint32_t SwitchMenuButtons(void) {
+  Dkc1GamepadState pads[2];
+  uint32_t buttons = 0;
+  const size_t count = Dkc1SwitchReadPads(pads, 2);
+  for (size_t i = 0; i < count; i++) buttons |= pads[i].buttons;
+  return buttons;
+}
+
+/* Returns 1 to keep the menu open. */
+static int SwitchMenuActivate(int item, int direction, char *status,
+                              size_t status_size) {
+  status[0] = 0;
+  switch (item) {
+    case kSwitchMenuResume:
+      return direction == 0 ? 0 : 1;
+    case kSwitchMenuSave:
+      if (direction != 0) return 1;
+      QuickSave();
+      s_toast_frames = 0;
+      snprintf(status, status_size, "%s", s_toast);
+      return 1;
+    case kSwitchMenuLoad:
+      if (direction != 0) return 1;
+      QuickLoad();
+      if (strncmp(s_toast, "No state", 8) == 0) {
+        s_toast_frames = 0;
+        snprintf(status, status_size, "%s", s_toast);
+        return 1;
+      }
+      return 0; /* loaded: straight back into the game */
+    case kSwitchMenuSlot:
+      s_graphics.state_slot =
+          (s_graphics.state_slot + (direction < 0 ? 4 : 1)) % 5;
+      Dkc1MacSaveGraphics(&s_graphics);
+      return 1;
+    case kSwitchMenuAspect: {
+      int aspect = (int)Dkc1VideoGetAspect();
+      aspect = (aspect + (direction < 0 ? 2 : 1)) % 3;
+      SetAspectMode((Dkc1VideoAspect)aspect);
+      s_graphics.aspect = Dkc1VideoGetAspect();
+      Dkc1MacSaveGraphics(&s_graphics);
+      return 1;
+    }
+    case kSwitchMenuScaling: {
+      /* Sharp -> Smooth -> HD (Reconstruct, OpenGL presenter only). */
+      static const int kOrder[] = {kDkc1UpscalerNearest, kDkc1UpscalerBilinear,
+                                   kDkc1UpscalerReconstruct};
+      const int count = s_switch_gl ? 3 : 2;
+      int index = 1;
+      for (int i = 0; i < count; i++)
+        if (kOrder[i] == s_graphics.upscaler) index = i;
+      index = (index + (direction < 0 ? count - 1 : 1)) % count;
+      s_graphics.upscaler = kOrder[index];
+      ApplyPresentationGeometry();
+      Dkc1MacSaveGraphics(&s_graphics);
+      if (!s_switch_gl && direction >= 0 && index == 0)
+        snprintf(status, status_size, "HD needs OpenGL (unavailable)");
+      return 1;
+    }
+    case kSwitchMenuHdDetail:
+      if (s_graphics.upscaler != kDkc1UpscalerReconstruct) return 1;
+      s_graphics.reconstruct_mode =
+          (s_graphics.reconstruct_mode + (direction < 0 ? 4 : 1)) % 5;
+      Dkc1MacSaveGraphics(&s_graphics);
+      return 1;
+    case kSwitchMenuVolume: {
+      int volume = s_graphics.audio_enabled ? s_graphics.volume : 0;
+      volume += direction < 0 ? -10 : 10;
+      if (direction == 0) volume = volume > 100 ? 0 : volume;
+      volume = volume < 0 ? 0 : volume > 100 ? 100 : volume;
+      s_graphics.volume = volume;
+      s_graphics.audio_enabled = 1;
+      Dkc1MacSaveGraphics(&s_graphics);
+      return 1;
+    }
+    case kSwitchMenuRumble:
+      Dkc1SwitchSetRumbleEnabled(!Dkc1SwitchRumbleEnabled());
+      Dkc1MacSaveGraphics(&s_graphics);
+      if (Dkc1SwitchRumbleEnabled())
+        Dkc1SwitchRumble(0.40f, 0.60f, 8); /* feel it right away */
+      return 1;
+    case kSwitchMenuExit:
+      if (direction != 0) return 1;
+      s_running = 0;
+      return 0;
+    default:
+      return 1;
+  }
+}
+
+static void SwitchPauseMenu(void) {
+  enum { kDirections = kDkc1GamepadDpadUp | kDkc1GamepadDpadDown |
+                       kDkc1GamepadDpadLeft | kDkc1GamepadDpadRight };
+  char status[64] = "";
+  int selected = 0;
+  int open = 1;
+  int held_frames = 0;
+  uint32_t previous;
+
+  if (s_menu_open || !Dkc1SwitchUiInit(s_renderer)) return;
+  s_menu_open = 1;
+  StopControllerRumble();
+  if (s_audio_device) SDL_PauseAudioDevice(s_audio_device, 1);
+  /* Buttons still held from the opening chord must be released first. */
+  previous = SwitchMenuButtons();
+
+  while (open && s_running) {
+    SDL_Event event;
+    if (!SwitchImpl_Tick()) {
+      s_running = 0;
+      break;
+    }
+    while (SDL_PollEvent(&event)) {
+      if (event.type == SDL_QUIT)
+        s_running = 0;
+      else if (event.type == SDL_JOYDEVICEADDED ||
+               event.type == SDL_JOYDEVICEREMOVED)
+        OpenFirstController();
+    }
+    const uint32_t buttons = SwitchMenuButtons();
+    uint32_t pressed = buttons & ~previous;
+    previous = buttons;
+    /* Auto-repeat for held directions. */
+    if (buttons & kDirections) {
+      held_frames++;
+      if (held_frames > 20 && (held_frames % 5) == 0)
+        pressed |= buttons & kDirections;
+    } else {
+      held_frames = 0;
+    }
+
+    if (pressed & kDkc1GamepadDpadUp)
+      selected = (selected + kSwitchMenuCount - 1) % kSwitchMenuCount;
+    if (pressed & kDkc1GamepadDpadDown)
+      selected = (selected + 1) % kSwitchMenuCount;
+    if (pressed & (kDkc1GamepadDpadLeft | kDkc1GamepadLeftShoulder))
+      open = SwitchMenuActivate(selected, -1, status, sizeof status);
+    else if (pressed & (kDkc1GamepadDpadRight | kDkc1GamepadRightShoulder))
+      open = SwitchMenuActivate(selected, 1, status, sizeof status);
+    else if (pressed & kDkc1GamepadA)
+      open = SwitchMenuActivate(selected, 0, status, sizeof status);
+    else if (pressed & (kDkc1GamepadB | kDkc1GamepadBack |
+                        kDkc1GamepadStart))
+      open = 0;
+    if (!open || !s_running) break;
+
+    PreparePresentation();
+    SwitchDrawMenu(selected, status);
+    Dkc1SwitchUiPresent(s_renderer);
+    SubmitPresentation();
+    Dkc1SwitchRumbleTick();
+  }
+
+  Dkc1SwitchUiClear();
+  s_menu_open = 0;
+  ResetAudioTimeline();
+  s_host_actions = s_previous_host_actions = 0;
+  s_input_release_gate = 1;
+  s_reanchor_pacer = 1;
+}
+#endif
+
 static void OpenPauseMenu(int graphics_page) {
 #ifndef __SWITCH__
   /* No pause menu on Switch: the stub always reports closed, so there is
@@ -1927,6 +2342,7 @@ static void OpenPauseMenu(int graphics_page) {
   Dkc1MacMetalPresenterSetActive(1); Present(); UpdateTitle();
 #else
   (void)graphics_page;
+  SwitchPauseMenu();
 #endif
 }
 
@@ -2169,6 +2585,9 @@ static void PollEvents(void) {
 
 static void Cleanup(uint8_t *rom) {
 #ifdef __SWITCH__
+  Dkc1SwitchRumbleStop();
+  Dkc1SwitchUiShutdown();
+  Dkc1SwitchGraphicsClose();
   Dkc1SwitchPerfEnd();
 #endif
 #ifdef _WIN32
@@ -2418,24 +2837,29 @@ int main(int argc, char **argv) {
     Cleanup(rom);
     return 3;
   }
+#ifdef __SWITCH__
+  if (!s_switch_gl && s_graphics.upscaler == kDkc1UpscalerReconstruct)
+    s_graphics.upscaler = kDkc1UpscalerBilinear; /* HD needs OpenGL */
+  if (!Dkc1SwitchUiInit(s_renderer))
+    fprintf(stderr, "warning: Switch UI overlay unavailable: %s\n",
+            SDL_GetError());
+#endif
   Dkc1MacLoadControls(&s_controls);
   Dkc1MacInstallMenu();
   InitAudio();
   OpenFirstController();
 #ifdef __SWITCH__
-  /* Battery SRAM persistence (no desktop host persists SRAM; Switch
-   * does): load, seed-if-missing, then the 30 s loop writer below plus
-   * the framework exit/focus hooks cover the rest. */
-  RtlEnsureSaveDir();
-  RtlReadSram();
+  /* In-game saves (saves/save.srm, same file as earlier builds): load
+   * now, then flush after every successful frame in which the cartridge
+   * RAM changed. The framework's Home-menu exit hook still writes too. */
   {
-    char sram_path[128];
-    RtlSramFilePath(sram_path, sizeof sram_path);
-    FILE *probe = fopen(sram_path, "rb");
-    if (probe)
-      fclose(probe);
-    else
-      RtlWriteSram();
+    char sram_error[256];
+    if (!Dkc1SramLoad(&s_sram_store, g_sram, (size_t)g_sram_size,
+                      sram_error, sizeof sram_error)) {
+      ShowError("Unable to load in-game saves", sram_error);
+      Cleanup(rom);
+      return 13;
+    }
   }
 #endif
 
@@ -2571,50 +2995,25 @@ int main(int argc, char **argv) {
     }
     phase_start = phase_end;
     uint32_t live_input = PollInput();
-#ifdef SWITCH_DEBUG
-    /* Debug-only (make DEBUG=1): L3 = quick-save, R3 = quick-load.
-     * Applied after the assist gate, which strips state actions while
-     * assist tools are off. Edge-triggered so a held click fires once. */
-    {
-      Dkc1GamepadState dbg_pad;
-      if (Dkc1SwitchReadPads(&dbg_pad, 1) > 0) {
-        static uint32_t s_prev_stick_click;
-        uint32_t cur = dbg_pad.buttons &
-            (kDkc1GamepadLeftStick | kDkc1GamepadRightStick);
-        uint32_t pressed = cur & ~s_prev_stick_click;
-        s_prev_stick_click = cur;
-        if (pressed & kDkc1GamepadLeftStick) {
-          s_host_actions |= kDkc1HostSaveState;
-          fprintf(stderr, "[SwitchDbg] quick-save\n");
-        }
-        if (pressed & kDkc1GamepadRightStick) {
-          s_host_actions |= kDkc1HostLoadState;
-          fprintf(stderr, "[SwitchDbg] quick-load\n");
-        }
-      }
-    }
-#endif
-#ifdef SWITCH_DEBUG
-    /* Debug-only (make DEBUG=1): L3 = quick-save, R3 = quick-load.
-     * Applied after the assist gate, which strips state actions while
-     * assist tools are off. Edge-triggered so a held click fires once. */
-    {
-      Dkc1GamepadState dbg_pad;
-      if (Dkc1SwitchReadPads(&dbg_pad, 1) > 0) {
-        static uint32_t s_prev_stick_click;
-        uint32_t cur = dbg_pad.buttons &
-            (kDkc1GamepadLeftStick | kDkc1GamepadRightStick);
-        uint32_t pressed = cur & ~s_prev_stick_click;
-        s_prev_stick_click = cur;
-        if (pressed & kDkc1GamepadLeftStick) {
-          s_host_actions |= kDkc1HostSaveState;
-          fprintf(stderr, "[SwitchDbg] quick-save\n");
-        }
-        if (pressed & kDkc1GamepadRightStick) {
-          s_host_actions |= kDkc1HostLoadState;
-          fprintf(stderr, "[SwitchDbg] quick-load\n");
-        }
-      }
+#ifdef __SWITCH__
+    /* L3 = save state, R3 = load state (current slot from the pause
+     * menu). Neither stick click is bound to the game. Applied after the
+     * assist gate, which strips state actions while assist tools are off.
+     * Edge-triggered so a held click fires once. */
+    if (!s_input_release_gate) {
+      Dkc1GamepadState hotkey_pads[2];
+      const size_t hotkey_count = Dkc1SwitchReadPads(hotkey_pads, 2);
+      static uint32_t s_prev_stick_click;
+      uint32_t cur = 0;
+      for (size_t i = 0; i < hotkey_count; i++)
+        cur |= hotkey_pads[i].buttons &
+               (kDkc1GamepadLeftStick | kDkc1GamepadRightStick);
+      const uint32_t clicked = cur & ~s_prev_stick_click;
+      s_prev_stick_click = cur;
+      if (clicked & kDkc1GamepadLeftStick)
+        s_host_actions |= kDkc1HostSaveState;
+      if (clicked & kDkc1GamepadRightStick)
+        s_host_actions |= kDkc1HostLoadState;
     }
 #endif
     if (s_assist_test_input.count)
@@ -2662,6 +3061,20 @@ int main(int argc, char **argv) {
     RtlRunFrame(input);
     if (Dkc1StompProbeAccepted(&s_stomp_probe, g_ram))
       PulseStompHaptic();
+#ifdef __SWITCH__
+    if (s_haptics_enabled) {
+      /* Life counter: one down = a Kong team was lost (strong, long
+       * rumble); up by 1..3 = extra life / balloon (light double tap). */
+      const int lives = ReadWram16(0x0575);
+      if (s_last_lives >= 0 && lives != s_last_lives) {
+        if (lives == s_last_lives - 1)
+          Dkc1SwitchRumble(0.80f, 0.45f, 22);
+        else if (lives > s_last_lives && lives <= s_last_lives + 3)
+          Dkc1SwitchRumble(0.15f, 0.55f, 6);
+      }
+      s_last_lives = lives;
+    }
+#endif
     ObserveMsu1MusicState();
     phase_end = FramePacerNow();
     work_profile.emulation += phase_end - phase_start;
@@ -2678,6 +3091,17 @@ int main(int argc, char **argv) {
       s_running = 0;
       break;
     }
+#ifdef __SWITCH__
+    {
+      char sram_error[256];
+      if (!Dkc1SramFlush(&s_sram_store, g_sram, (size_t)g_sram_size, false,
+                         sram_error, sizeof sram_error) &&
+          !s_sram_error_reported) {
+        s_sram_error_reported = 1;
+        ShowError("Unable to write in-game saves", sram_error);
+      }
+    }
+#endif
     phase_start = phase_end;
     Dkc1DrawPpuFrame();
     phase_end = FramePacerNow();
@@ -2685,14 +3109,13 @@ int main(int argc, char **argv) {
     phase_start = phase_end;
     s_host_frame++;
 #ifdef __SWITCH__
-    /* Persist SRAM every ~30 s so progress survives unclean exits; the
-     * framework exit/focus hooks cover clean quits. */
-    if (s_host_frame != 0 && (s_host_frame % 1800) == 0)
-      RtlWriteSram();
     /* Dock/handheld transitions mid-session: resize to the matching
      * mode (checked 12x/sec; SDL_SetWindowSize switches the output). */
     if ((s_host_frame % 300) == 0)
       Dkc1SwitchPerfTick();
+    Dkc1SwitchRumbleTick();
+    if (s_toast_frames > 0)
+      s_toast_frames--;
     if ((s_host_frame % 5) == 0) {
       int want_w = 1280, want_h = 720;
       int cur_w = 0, cur_h = 0;
@@ -2822,6 +3245,14 @@ int main(int argc, char **argv) {
   FramePacerPrintStats(&pacer);
   DisplayPacerPrintStats(&display_pacer);
   PacingLogClose(&pacing_log);
+#ifdef __SWITCH__
+  if (!g_fail && Dkc1LastLleResult()) {
+    char sram_error[256];
+    if (!Dkc1SramFlush(&s_sram_store, g_sram, (size_t)g_sram_size, true,
+                       sram_error, sizeof sram_error))
+      ShowError("Unable to write in-game saves", sram_error);
+  }
+#endif
   Cleanup(rom);
   return 0;
 }

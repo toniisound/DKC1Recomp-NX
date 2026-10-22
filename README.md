@@ -1,6 +1,6 @@
-# DKC1Recomp NX — 60 fps edition
+# DKC1Recomp-NX
 
-Fork of [souldbminerr/DKC1Recomp-NX](https://github.com/souldbminerr/DKC1Recomp-NX)
+By **Toniisound** — version 0.0.17. Fork of [souldbminerr/DKC1Recomp-NX](https://github.com/souldbminerr/DKC1Recomp-NX)
 (itself based on [elliotttate/DKC1Recomp](https://github.com/elliotttate/DKC1Recomp))
 with these Nintendo Switch improvements:
 
@@ -11,6 +11,24 @@ with these Nintendo Switch improvements:
   re-applied after dock/undock or sleep.
 - **On-screen error** when the ROM is missing or unsupported (system error
   dialog) instead of a silent exit.
+- **Pause menu** (press **−**; **+** is still the game's own pause): save/load
+  state, state slot (1–5), aspect ratio (4:3 / 16:10 / 16:9), scaling
+  (Sharp / Smooth / **HD**), HD detail, volume, rumble on/off and exit.
+- **HD upscaler**: the "Reconstruct" shader from the Windows/Mac builds,
+  running on the Switch GPU through OpenGL (Mesa). It redraws pixel-art
+  edges, slopes and dithering at full 720p/1080p resolution for the whole
+  game. Five detail levels (Pixels, Dither, Diagonals, Slopes, Slopes+). If
+  OpenGL cannot start, the game falls back to the plain renderer.
+- **Settings are remembered** in `sdmc:/switch/dkc1/dkc1nx.ini`.
+- **Safer in-game saves**: Candy's saves are written to
+  `saves/save.srm` the moment the game saves (atomic write, previous file
+  kept as `save.srm.bak`), instead of every 30 seconds. Ported from upstream
+  [elliotttate/DKC1Recomp](https://github.com/elliotttate/DKC1Recomp).
+- **Save states**: **L3** saves and **R3** loads the current slot during
+  play, with an on-screen confirmation. Files live next to the .nro.
+- **HD Rumble**: a short tap when you stomp an enemy, a strong rumble when
+  you lose a life and a light one when you gain one (Joy-Con, Pro Controller
+  and handheld).
 - **New icon** and a minimal RomFS so the .nro also boots on emulators that
   require one.
 - **Self-contained build**: the Switch layer for the `snesrecomp` framework is
@@ -28,6 +46,18 @@ sh scripts/setup_switch_framework.sh          # Switch layer -> snesrecomp
 python3 scripts/generate_snesrecomp.py --rom /path/to/dkc1.sfc   # needs Rust (cargo)
 make -f Makefile.switch
 ```
+
+## Controls
+
+| Button | Action |
+|---|---|
+| D-Pad / Left stick | Move |
+| A / B / X / Y | SNES A / B / X / Y |
+| ZL / ZR | SNES L / R |
+| + | Start (game pause) |
+| L | Select |
+| **−** | Pause menu |
+| **L3** / **R3** | Save state / Load state |
 
 ## Installing
 

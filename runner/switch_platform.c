@@ -15,6 +15,8 @@
 #include <SDL.h>
 #include <switch.h>
 
+#include <stdbool.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -25,6 +27,7 @@
 #include "macos_file_picker.h"
 #include "macos_metal_presenter.h"
 #include "macos_pause_menu.h"
+#include "switch_gamepad.h"
 
 /* ROM and content pickers: the Switch build boots straight from the SD
  * app dir (see SwitchImpl_ResolveRom) and never prompts. */
@@ -47,15 +50,146 @@ void Dkc1MacSetFullscreenScaling(Dkc1MacFullscreenScaling scaling) {
 Dkc1EdgePolicy Dkc1MacSavedWidescreenEdge(void) { return kDkc1EdgeGlide; }
 void Dkc1MacSetWidescreenEdge(Dkc1EdgePolicy policy) { (void)policy; }
 
-/* Graphics settings: desktop defaults (16:9, bilinear buddy) with no
- * persistence yet. There is no settings UI on Switch, so there is
- * nothing to persist back. */
+/* ---- Persistent settings ------------------------------------------------
+ * The pause menu edits these and they survive reboots in
+ * sdmc:/switch/<app>/dkc1nx.ini (cwd is the app dir after SwitchImpl_Init).
+ * Plain key=value lines; unknown keys are ignored, missing keys keep the
+ * defaults, so older/newer files stay compatible. */
+#define DKC1_SWITCH_SETTINGS_FILE "dkc1nx.ini"
+
+static int s_rumble_enabled = 1;
+
+static int ClampInt(int value, int lo, int hi) {
+  return value < lo ? lo : value > hi ? hi : value;
+}
+
 void Dkc1MacLoadGraphics(Dkc1GraphicsSettings *settings) {
+  FILE *file;
+  char line[128];
   if (!settings) return;
   Dkc1GraphicsDefault(settings);
+  /* Switch defaults: 16:9 picture, smooth (bilinear) scaling. */
+  settings->aspect = 2;
+  settings->upscaler = kDkc1UpscalerBilinear;
+  file = fopen(DKC1_SWITCH_SETTINGS_FILE, "r");
+  if (!file) return;
+  while (fgets(line, sizeof line, file)) {
+    char key[32];
+    int value;
+    if (sscanf(line, " %31[a-z_] = %d", key, &value) != 2) continue;
+    if (strcmp(key, "aspect") == 0)
+      settings->aspect = ClampInt(value, 0, 2);
+    else if (strcmp(key, "smooth") == 0) /* older builds */
+      settings->upscaler =
+          value ? kDkc1UpscalerBilinear : kDkc1UpscalerNearest;
+    else if (strcmp(key, "scaling") == 0)
+      settings->upscaler = value == 0   ? kDkc1UpscalerNearest
+                           : value == 2 ? kDkc1UpscalerReconstruct
+                                        : kDkc1UpscalerBilinear;
+    else if (strcmp(key, "hd_detail") == 0)
+      settings->reconstruct_mode = ClampInt(value, 0, 4);
+    else if (strcmp(key, "volume") == 0)
+      settings->volume = ClampInt(value, 0, 100);
+    else if (strcmp(key, "slot") == 0)
+      settings->state_slot = ClampInt(value, 0, 4);
+    else if (strcmp(key, "rumble") == 0)
+      s_rumble_enabled = value != 0;
+  }
+  fclose(file);
 }
+
 void Dkc1MacSaveGraphics(const Dkc1GraphicsSettings *settings) {
-  (void)settings;
+  FILE *file;
+  if (!settings) return;
+  file = fopen(DKC1_SWITCH_SETTINGS_FILE, "w");
+  if (!file) return;
+  fprintf(file,
+          "# DKC1 NX settings (edited from the pause menu)\n"
+          "aspect=%d\n"
+          "# scaling: 0 sharp, 1 smooth, 2 HD (Reconstruct)\n"
+          "scaling=%d\n"
+          "# hd_detail: 0 pixels, 1 dither, 2 diagonals, 3 slopes, 4 slopes+\n"
+          "hd_detail=%d\n"
+          "volume=%d\n"
+          "slot=%d\n"
+          "rumble=%d\n",
+          settings->aspect,
+          settings->upscaler == kDkc1UpscalerNearest       ? 0
+          : settings->upscaler == kDkc1UpscalerReconstruct ? 2
+                                                           : 1,
+          settings->reconstruct_mode,
+          settings->volume, settings->state_slot, s_rumble_enabled);
+  fclose(file);
+}
+
+int Dkc1SwitchRumbleEnabled(void) { return s_rumble_enabled; }
+void Dkc1SwitchSetRumbleEnabled(int enabled) {
+  s_rumble_enabled = enabled != 0;
+  if (!s_rumble_enabled) Dkc1SwitchRumbleStop();
+}
+
+/* ---- HD Rumble ------------------------------------------------------------
+ * Driven straight through hid: SDL2's Switch joystick backend is not used
+ * for vibration. Handles exist for handheld mode and for player 1 as a Pro
+ * Controller (FullKey) or a pair of Joy-Con (JoyDual); a pulse goes to
+ * whichever of those is currently attached and stops on its own after the
+ * requested number of frames (Dkc1SwitchRumbleTick, once per frame). */
+static HidVibrationDeviceHandle s_vib_handheld[2];
+static HidVibrationDeviceHandle s_vib_fullkey[2];
+static HidVibrationDeviceHandle s_vib_joydual[2];
+static bool s_vib_ok_handheld, s_vib_ok_fullkey, s_vib_ok_joydual;
+static bool s_vib_init;
+static int s_vib_frames_left;
+
+static void RumbleInit(void) {
+  if (s_vib_init) return;
+  s_vib_init = true;
+  s_vib_ok_handheld = R_SUCCEEDED(hidInitializeVibrationDevices(
+      s_vib_handheld, 2, HidNpadIdType_Handheld,
+      HidNpadStyleTag_NpadHandheld));
+  s_vib_ok_fullkey = R_SUCCEEDED(hidInitializeVibrationDevices(
+      s_vib_fullkey, 2, HidNpadIdType_No1, HidNpadStyleTag_NpadFullKey));
+  s_vib_ok_joydual = R_SUCCEEDED(hidInitializeVibrationDevices(
+      s_vib_joydual, 2, HidNpadIdType_No1, HidNpadStyleTag_NpadJoyDual));
+}
+
+static void RumbleSend(const HidVibrationValue *value) {
+  HidVibrationValue values[2];
+  u32 handheld_style, player_style;
+  RumbleInit();
+  values[0] = *value;
+  values[1] = *value;
+  handheld_style = hidGetNpadStyleSet(HidNpadIdType_Handheld);
+  player_style = hidGetNpadStyleSet(HidNpadIdType_No1);
+  if (s_vib_ok_handheld && (handheld_style & HidNpadStyleTag_NpadHandheld))
+    (void)hidSendVibrationValues(s_vib_handheld, values, 2);
+  if (s_vib_ok_fullkey && (player_style & HidNpadStyleTag_NpadFullKey))
+    (void)hidSendVibrationValues(s_vib_fullkey, values, 2);
+  if (s_vib_ok_joydual && (player_style & HidNpadStyleTag_NpadJoyDual))
+    (void)hidSendVibrationValues(s_vib_joydual, values, 2);
+}
+
+void Dkc1SwitchRumble(float low, float high, int frames) {
+  HidVibrationValue value;
+  if (!s_rumble_enabled || frames <= 0) return;
+  value.amp_low = low;
+  value.freq_low = 160.0f;
+  value.amp_high = high;
+  value.freq_high = 320.0f;
+  RumbleSend(&value);
+  if (frames > s_vib_frames_left) s_vib_frames_left = frames;
+}
+
+void Dkc1SwitchRumbleStop(void) {
+  HidVibrationValue value = {0.0f, 160.0f, 0.0f, 320.0f};
+  if (!s_vib_init) return;
+  s_vib_frames_left = 0;
+  RumbleSend(&value);
+}
+
+void Dkc1SwitchRumbleTick(void) {
+  if (s_vib_frames_left <= 0) return;
+  if (--s_vib_frames_left == 0) Dkc1SwitchRumbleStop();
 }
 void Dkc1MacInstallMenu(void) {}
 void Dkc1MacUpdateGraphicsMenuState(int display, int upscaler, int screen) {
@@ -84,7 +218,7 @@ void Dkc1MacUpdateMenuState(int paused, int fullscreen,
 /* Fixed handheld controls: both players on gamepads with the straight
  * Switch layout (labels already sit at the SNES positions, unlike the
  * crossed Xbox-physical desktop defaults). ABXY at face value, ZL/ZR as
- * L/R triggers, Plus as Start, Minus as Select. Assist shortcuts are
+ * L/R triggers, Plus as Start, L as Select (Minus opens the pause menu). Assist shortcuts are
  * cleared so triggers never double as rewind/fast-forward. */
 void Dkc1MacLoadControls(Dkc1Controls *controls) {
   static const int kSwitchPads[12] = {
@@ -99,7 +233,8 @@ void Dkc1MacLoadControls(Dkc1Controls *controls) {
       DKC1_PAD_AXIS(SDL_CONTROLLER_AXIS_TRIGGERLEFT, 1),
       DKC1_PAD_AXIS(SDL_CONTROLLER_AXIS_TRIGGERRIGHT, 1),
       DKC1_PAD_BUTTON(SDL_CONTROLLER_BUTTON_START),
-      DKC1_PAD_BUTTON(SDL_CONTROLLER_BUTTON_BACK),
+      /* SNES Select on the L button: Minus opens the pause menu. */
+      DKC1_PAD_BUTTON(SDL_CONTROLLER_BUTTON_LEFTSHOULDER),
   };
   int player;
 
@@ -188,8 +323,6 @@ void Dkc1MacMetalPresenterSetGraphics(const Dkc1GraphicsSettings *settings) {
  * Switch SDL2 has no message-box backend and hbmenu shows no stderr, so a
  * missing ROM used to look like a silent crash. The system error applet
  * draws a native dialog and blocks until the player dismisses it. */
-#include <stdio.h>
-
 void Dkc1SwitchShowError(const char *title, const char *message) {
   char dialog[512];
   ErrorApplicationConfig config;

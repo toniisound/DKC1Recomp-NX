@@ -18,9 +18,15 @@ mkdir -p "$SR/runner/src/switch"
 cp "$OV/runner/src/switch/switch_impl.c" "$OV/runner/src/switch/switch_impl.h" \
    "$SR/runner/src/switch/"
 
-if grep -q '"horizon"' "$SR/runner/src/host_report.c"; then
+if grep -q 'horizon' "$SR/runner/src/host_report.c"; then
   echo "host_report.c already patched"
 else
   patch -p1 -d "$SR" < "$OV/host_report-switch.patch"
+fi
+# Release builds: no tier2_*.json / tier2_*.jsonl developer logs on the SD.
+if grep -q 'no tier2_\*.jsonl' "$SR/runner/src/snes/tier2_capture.c"; then
+  echo "tier2 logs already disabled"
+else
+  patch -p1 -d "$SR" < "$OV/no-tier2-logs.patch"
 fi
 echo "Switch framework layer ready."

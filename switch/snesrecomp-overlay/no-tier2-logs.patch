@@ -1,0 +1,33 @@
+diff --git a/runner/src/snes/interp_bridge.c b/runner/src/snes/interp_bridge.c
+index 9d79428..a8a2d19 100644
+--- a/runner/src/snes/interp_bridge.c
++++ b/runner/src/snes/interp_bridge.c
+@@ -2231,6 +2231,11 @@ void Tier2CoverageWriteManifest(const char *path, const char *rom_title) {
+ }
+ 
+ void Tier2CoverageWriteDefaultManifest(const char *rom_title) {
++#ifdef __SWITCH__
++    /* Switch release: no per-run tier2_*.json coverage files on the SD. */
++    (void)rom_title;
++    return;
++#endif
+     const char *path = tier2_capture_manifest_path(rom_title);
+     Tier2CoverageWriteManifest(path, rom_title);
+     if (tier2_verbose())
+diff --git a/runner/src/snes/tier2_capture.c b/runner/src/snes/tier2_capture.c
+index de1f87a..477289a 100644
+--- a/runner/src/snes/tier2_capture.c
++++ b/runner/src/snes/tier2_capture.c
+@@ -138,6 +138,12 @@ int tier2_capture_append_discovery(const char *rom_title,
+                                    const char *site_kind,
+                                    int outcome,
+                                    int32_t frame) {
++#ifdef __SWITCH__
++    /* Switch release: no tier2_*.jsonl dispatch-miss journal on the SD. */
++    (void)rom_title; (void)site_pc24; (void)target_pc24; (void)entry_mx;
++    (void)site_kind; (void)outcome; (void)frame;
++    return 1;
++#endif
+     init_paths(rom_title);
+     if (!s_journal) {
+         s_journal = fopen(s_journal_path, "a");

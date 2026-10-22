@@ -51,6 +51,15 @@ void Dkc1SwitchPerfEnd(void);
 /* Native system error dialog (blocks until dismissed). */
 void Dkc1SwitchShowError(const char *title, const char *message);
 
+/* HD Rumble (runner/switch_platform.c). Amplitudes 0..1; the pulse stops
+ * by itself after `frames` calls to Dkc1SwitchRumbleTick (one per frame). */
+void Dkc1SwitchRumble(float low, float high, int frames);
+void Dkc1SwitchRumbleStop(void);
+void Dkc1SwitchRumbleTick(void);
+/* Rumble on/off, persisted with the other settings in dkc1nx.ini. */
+int Dkc1SwitchRumbleEnabled(void);
+void Dkc1SwitchSetRumbleEnabled(int enabled);
+
 /* Left-stick deflection that counts as a DPad press (raw SDL units). */
 #define DKC1_SWITCH_STICK_DPAD_DEADZONE 8000
 
